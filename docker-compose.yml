@@ -1,0 +1,40 @@
+version: "3.8"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: nexadex
+      POSTGRES_USER: nexadex
+      POSTGRES_PASSWORD: nexadex
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexadex"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  dex:
+    build:
+      context: ..
+      dockerfile: nexa-dex/Dockerfile
+    ports:
+      - "9090:9090"
+    environment:
+      NEXADEX_HOST: "0.0.0.0"
+      NEXADEX_PORT: "9090"
+      NEXADEX_DB_URL: "jdbc:postgresql://db:5432/nexadex"
+      NEXADEX_DB_USER: "nexadex"
+      NEXADEX_DB_PASSWORD: "nexadex"
+      NEXADEX_ROSTRUM_URL: "wss://electrum.nexa.org:20004"
+      NEXADEX_ROSTRUM_SSL: "true"
+      NEXADEX_CORS_ORIGINS: "${NEXADEX_CORS_ORIGINS}"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

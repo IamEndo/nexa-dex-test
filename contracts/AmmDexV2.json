@@ -1,0 +1,46 @@
+
+{
+  "contracts": [
+    {
+      "contractName": "AmmDexV2",
+      "constructorInputs": [
+        {
+          "name": "groupId",
+          "type": "bytes32",
+          "visible": false,
+          "unused": false
+        },
+        {
+          "name": "lpProvider",
+          "type": "pubkey",
+          "visible": false,
+          "unused": false
+        }
+      ],
+      "abi": [
+        {
+          "name": "swap",
+          "inputs": []
+        },
+        {
+          "name": "manageLiquidity",
+          "inputs": [
+            {
+              "name": "lpSig",
+              "type": "sig"
+            }
+          ]
+        }
+      ],
+      "dependencies": [],
+      "bytecode": "OP_FROMALTSTACK OP_FROMALTSTACK OP_2 OP_PICK OP_0 OP_NUMEQUAL OP_IF OP_0 OP_OUTPUTBYTECODE OP_INPUTINDEX OP_UTXOBYTECODE OP_OVER OP_ROT OP_SIZE OP_NIP 2a OP_SUB OP_SPLIT OP_2 OP_PICK OP_3 OP_ROLL OP_SIZE OP_NIP 2a OP_SUB OP_SPLIT OP_ROT OP_EQUALVERIFY OP_SWAP 21 OP_SPLIT OP_SWAP OP_1 OP_SPLIT OP_4 OP_ROLL OP_EQUALVERIFY OP_SWAP OP_SIZE OP_NIP OP_0 OP_GREATERTHAN OP_VERIFY OP_SIZE OP_NIP OP_0 OP_GREATERTHAN OP_VERIFY OP_SIZE OP_NIP OP_0 OP_GREATERTHAN OP_VERIFY OP_INPUTINDEX OP_UTXOVALUE OP_INPUTINDEX OP_1 OP_1 OP_1 OP_PARSE OP_0 OP_OUTPUTVALUE OP_0 OP_1 OP_1 OP_0 OP_PARSE OP_2DUP OP_MUL OP_4 OP_ROLL OP_4 OP_ROLL OP_MUL OP_GREATERTHANOREQUAL OP_VERIFY OP_SWAP 2202 OP_GREATERTHANOREQUAL OP_VERIFY OP_0 OP_GREATERTHAN OP_VERIFY OP_2DROP OP_ELSE OP_ROT OP_1 OP_NUMEQUALVERIFY OP_ROT OP_ROT OP_CHECKSIGVERIFY OP_0 OP_OUTPUTBYTECODE OP_INPUTINDEX OP_UTXOBYTECODE OP_OVER OP_ROT OP_SIZE OP_NIP 2a OP_SUB OP_SPLIT OP_2 OP_PICK OP_3 OP_ROLL OP_SIZE OP_NIP 2a OP_SUB OP_SPLIT OP_ROT OP_EQUALVERIFY OP_SWAP 21 OP_SPLIT OP_ROT 21 OP_SPLIT OP_3 OP_ROLL OP_ROT OP_EQUALVERIFY OP_SWAP OP_SIZE OP_NIP OP_0 OP_GREATERTHAN OP_VERIFY OP_SIZE OP_NIP OP_0 OP_GREATERTHAN OP_VERIFY OP_DROP OP_ENDIF",
+      "contracts": []
+    }
+  ],
+  "source": "/**\n * AmmDexV2 — Permissionless Constant-Product AMM\n *\n * Pool UTXO holds both NEX (satoshis) and tokens (grouped amount).\n * Anyone can swap by spending the pool UTXO and recreating it with\n * updated reserves that satisfy the constant-product invariant.\n *\n * swap():            Permissionless — no signature required.\n * manageLiquidity(): LP-only — requires LP signature.\n *\n * Security:\n * - Per-UTXO K invariant: newNex * newTokens >= oldNex * oldTokens\n * - Self-replication: output script must match input script\n * - Token group enforcement: output must carry correct token group\n * - Minimum reserves: prevents draining to dust\n */\ncontract AmmDexV2(bytes32 groupId, pubkey lpProvider) {\n\n    /**\n     * Permissionless swap. Anyone can call this.\n     * User adds their own inputs (NEX or tokens) and takes output.\n     * Contract enforces constant-product invariant on the pool UTXO.\n     */\n    function swap() {\n        // 1. Self-replication: output[0] must recreate this contract\n        //    lockingBytecode includes the group prefix (groupId + groupAmount)\n        //    which changes on every swap, so we compare only the contract part:\n        //    the last 42 bytes = push(20, templateHash) + push(20, constraintHash)\n        //    Note: groupId is embedded in the constraint hash (constructor arg),\n        //    so this also implicitly verifies the token group is correct.\n        bytes outBytecode = tx.outputs[0].lockingBytecode;\n        bytes inBytecode = tx.inputs[this.activeInputIndex].lockingBytecode;\n        bytes outHead, bytes outTail = outBytecode.split(outBytecode.length - 42);\n        bytes inHead, bytes inTail = inBytecode.split(inBytecode.length - 42);\n        require(outTail == inTail);\n        // Verify the output groupId matches the constructor groupId\n        // outHead = push(32, groupId) + push(N, amount)\n        // First byte is push opcode (0x20), next 32 bytes are groupId\n        bytes outGidPush, bytes outAmt = outHead.split(33);\n        // Extract groupId bytes (skip the push prefix byte)\n        bytes outPushByte, bytes outGidBytes = outGidPush.split(1);\n        require(outGidBytes == groupId);\n        require(outAmt.length > 0);\n        require(outPushByte.length > 0);\n        require(inHead.length > 0);\n\n        // 2. Pool reserves BEFORE swap\n        int oldNex = tx.inputs[this.activeInputIndex].value;\n        int oldTokens = tx.inputs[this.activeInputIndex].tokenAmount;\n\n        // 3. Pool reserves AFTER swap\n        int newNex = tx.outputs[0].value;\n        int newTokens = tx.outputs[0].tokenAmount;\n\n        // 4. Constant product: K can only increase (fee is implicit)\n        require(newNex * newTokens >= oldNex * oldTokens);\n\n        // 5. Minimum reserves (prevent draining)\n        require(newNex >= 546);\n        require(newTokens > 0);\n    }\n\n    /**\n     * LP-only liquidity management.\n     * LP can add or remove liquidity (changes reserves without swap constraint).\n     * Self-replication still enforced (pool stays at same contract address).\n     */\n    function manageLiquidity(sig lpSig) {\n        require(checkSig(lpSig, lpProvider));\n        // For manageLiquidity, LP can change token amounts too, so use tail compare\n        bytes outBytecode = tx.outputs[0].lockingBytecode;\n        bytes inBytecode = tx.inputs[this.activeInputIndex].lockingBytecode;\n        bytes outHead, bytes outTail = outBytecode.split(outBytecode.length - 42);\n        bytes inHead, bytes inTail = inBytecode.split(inBytecode.length - 42);\n        require(outTail == inTail);\n        bytes outGid, bytes outAmt = outHead.split(33);\n        bytes inGid, bytes inAmt = inHead.split(33);\n        require(outGid == inGid);\n        require(outAmt.length > 0);\n        require(inAmt.length > 0);\n    }\n}\n",
+  "compiler": {
+    "name": "nexc",
+    "version": "1.0.3"
+  },
+  "updatedAt": "2026-03-08T13:54:51.709Z"
+}

@@ -1,0 +1,82 @@
+/**
+ * AmmDexV2 — Permissionless Constant-Product AMM
+ *
+ * Pool UTXO holds both NEX (satoshis) and tokens (grouped amount).
+ * Anyone can swap by spending the pool UTXO and recreating it with
+ * updated reserves that satisfy the constant-product invariant.
+ *
+ * swap():            Permissionless — no signature required.
+ * manageLiquidity(): LP-only — requires LP signature.
+ *
+ * Security:
+ * - Per-UTXO K invariant: newNex * newTokens >= oldNex * oldTokens
+ * - Self-replication: output script must match input script
+ * - Token group enforcement: output must carry correct token group
+ * - Minimum reserves: prevents draining to dust
+ */
+contract AmmDexV2(bytes32 groupId, pubkey lpProvider) {
+
+    /**
+     * Permissionless swap. Anyone can call this.
+     * User adds their own inputs (NEX or tokens) and takes output.
+     * Contract enforces constant-product invariant on the pool UTXO.
+     */
+    function swap() {
+        // 1. Self-replication: output[0] must recreate this contract
+        //    lockingBytecode includes the group prefix (groupId + groupAmount)
+        //    which changes on every swap, so we compare only the contract part:
+        //    the last 42 bytes = push(20, templateHash) + push(20, constraintHash)
+        //    Note: groupId is embedded in the constraint hash (constructor arg),
+        //    so this also implicitly verifies the token group is correct.
+        bytes outBytecode = tx.outputs[0].lockingBytecode;
+        bytes inBytecode = tx.inputs[this.activeInputIndex].lockingBytecode;
+        bytes outHead, bytes outTail = outBytecode.split(outBytecode.length - 42);
+        bytes inHead, bytes inTail = inBytecode.split(inBytecode.length - 42);
+        require(outTail == inTail);
+        // Verify the output groupId matches the constructor groupId
+        // outHead = push(32, groupId) + push(N, amount)
+        // First byte is push opcode (0x20), next 32 bytes are groupId
+        bytes outGidPush, bytes outAmt = outHead.split(33);
+        // Extract groupId bytes (skip the push prefix byte)
+        bytes outPushByte, bytes outGidBytes = outGidPush.split(1);
+        require(outGidBytes == groupId);
+        require(outAmt.length > 0);
+        require(outPushByte.length > 0);
+        require(inHead.length > 0);
+
+        // 2. Pool reserves BEFORE swap
+        int oldNex = tx.inputs[this.activeInputIndex].value;
+        int oldTokens = tx.inputs[this.activeInputIndex].tokenAmount;
+
+        // 3. Pool reserves AFTER swap
+        int newNex = tx.outputs[0].value;
+        int newTokens = tx.outputs[0].tokenAmount;
+
+        // 4. Constant product: K can only increase (fee is implicit)
+        require(newNex * newTokens >= oldNex * oldTokens);
+
+        // 5. Minimum reserves (prevent draining)
+        require(newNex >= 546);
+        require(newTokens > 0);
+    }
+
+    /**
+     * LP-only liquidity management.
+     * LP can add or remove liquidity (changes reserves without swap constraint).
+     * Self-replication still enforced (pool stays at same contract address).
+     */
+    function manageLiquidity(sig lpSig) {
+        require(checkSig(lpSig, lpProvider));
+        // For manageLiquidity, LP can change token amounts too, so use tail compare
+        bytes outBytecode = tx.outputs[0].lockingBytecode;
+        bytes inBytecode = tx.inputs[this.activeInputIndex].lockingBytecode;
+        bytes outHead, bytes outTail = outBytecode.split(outBytecode.length - 42);
+        bytes inHead, bytes inTail = inBytecode.split(inBytecode.length - 42);
+        require(outTail == inTail);
+        bytes outGid, bytes outAmt = outHead.split(33);
+        bytes inGid, bytes inAmt = inHead.split(33);
+        require(outGid == inGid);
+        require(outAmt.length > 0);
+        require(inAmt.length > 0);
+    }
+}
