@@ -342,6 +342,10 @@ fun Application.walletPollRoutes(sessionManager: SessionManager, swapServiceV2: 
             val cookie = call.request.queryParameters["cookie"]
             val txHex = call.request.queryParameters["tx"]
 
+            logger.info("/tx callback: cookie={}, txPresent={}, txLen={}, queryKeys={}",
+                cookie?.take(8) ?: "NULL", txHex != null, txHex?.length ?: 0,
+                call.request.queryParameters.names().joinToString(","))
+
             if (cookie.isNullOrBlank() || txHex.isNullOrBlank()) {
                 call.respondText(
                     json.encodeToString(TxReturnResponse("error", "Missing cookie or tx parameter")),
@@ -438,9 +442,52 @@ fun Application.walletPollRoutes(sessionManager: SessionManager, swapServiceV2: 
                         }
                 }
 
+                "add_liquidity", "remove_liquidity" -> {
+                    val result = swapServiceV2.broadcastAndRecordLiquidity(
+                        signedTxHex = txHex,
+                        poolId = pending.poolId,
+                        action = pending.action,
+                        nexAmount = pending.nexAmount,
+                        tokenAmount = pending.tokenAmount,
+                        lpTokenAmount = pending.lpTokenAmount,
+                        newNexReserve = pending.newNexReserve,
+                        newTokenReserve = pending.newTokenReserve,
+                    )
+
+                    result
+                        .onSuccess { lpResult ->
+                            launch {
+                                sessionManager.pushToBrowsers(session, WsBrowserMessage(
+                                    type = "tx_signed",
+                                    data = """{"action":"${pending.action}","txId":"${lpResult.txId}","poolId":${lpResult.poolId},"nexAmount":${lpResult.nexAmount},"tokenAmount":${lpResult.tokenAmount},"lpTokenAmount":${lpResult.lpTokenAmount}}""",
+                                ))
+                            }
+
+                            call.respondText(
+                                json.encodeToString(TxReturnResponse("ok", "Liquidity broadcast: ${lpResult.txId}")),
+                                ContentType.Application.Json,
+                                HttpStatusCode.OK,
+                            )
+                        }
+                        .onFailure { error ->
+                            logger.warn("Liquidity broadcast failed: {}", error.message)
+
+                            launch {
+                                sessionManager.pushToBrowsers(session, WsBrowserMessage(
+                                    type = "tx_error",
+                                    data = """{"action":"${pending.action}","error":"${error.message}"}""",
+                                ))
+                            }
+
+                            call.respondText(
+                                json.encodeToString(TxReturnResponse("error", error.message)),
+                                ContentType.Application.Json,
+                                HttpStatusCode.BadRequest,
+                            )
+                        }
+                }
+
                 else -> {
-                    // For LP and pool creation actions (future)
-                    // Just notify browsers for now
                     launch {
                         sessionManager.pushToBrowsers(session, WsBrowserMessage(
                             type = "tx_signed",

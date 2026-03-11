@@ -112,8 +112,8 @@ fun Application.liquidityRoutes(
             }
 
             if (req.cookie.isNotBlank()) {
-                // TDPP/Wally-based liquidity — not yet implemented
-                return@post call.respondError("NOT_IMPLEMENTED", "Wallet-based liquidity is not yet supported. Use mnemonic flow.")
+                // Wallet-based: use POST /api/v2/liquidity/prepare instead
+                return@post call.respondError("USE_PREPARE", "Wallet-based liquidity: use POST /api/v2/liquidity/prepare with cookie")
             }
             if (req.mnemonic.isBlank()) {
                 return@post call.respondError("INVALID_PARAM", "Mnemonic is required")
@@ -167,8 +167,8 @@ fun Application.liquidityRoutes(
             }
 
             if (req.cookie.isNotBlank()) {
-                // TDPP/Wally-based liquidity — not yet implemented
-                return@post call.respondError("NOT_IMPLEMENTED", "Wallet-based liquidity is not yet supported. Use mnemonic flow.")
+                // Wallet-based: use POST /api/v2/liquidity/prepare instead
+                return@post call.respondError("USE_PREPARE", "Wallet-based liquidity: use POST /api/v2/liquidity/prepare with cookie")
             }
             if (req.mnemonic.isBlank()) {
                 return@post call.respondError("INVALID_PARAM", "Mnemonic is required")

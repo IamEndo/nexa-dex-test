@@ -39,6 +39,26 @@ data class SwapPrepareResponse(
     val priceImpactBps: Int,
 )
 
+@Serializable
+data class LiquidityPrepareRequest(
+    val poolId: Int,
+    val action: String, // "add" or "remove"
+    val cookie: String,
+    val nexSats: Long = 0,
+    val tokenAmount: Long = 0,
+    val lpTokenAmount: Long = 0,
+)
+
+@Serializable
+data class LiquidityPrepareResponse(
+    val status: String,
+    val poolId: Int,
+    val action: String,
+    val nexAmount: Long,
+    val tokenAmount: Long,
+    val lpTokenAmount: Long,
+)
+
 fun Application.tdppRoutes(
     swapServiceV2: SwapServiceV2,
     sessionManager: SessionManager,
@@ -173,6 +193,119 @@ fun Application.tdppRoutes(
                             amountOut = tdppResult.amountOut,
                             price = tdppResult.price,
                             priceImpactBps = tdppResult.priceImpactBps,
+                        ),
+                    ),
+                ),
+                ContentType.Application.Json,
+            )
+        }
+
+        /**
+         * POST /api/v2/liquidity/prepare
+         *
+         * Builds a partial liquidity transaction and pushes a TDPP URI to Wally.
+         * Mirrors swap/prepare but for add/remove liquidity.
+         */
+        post("/api/v2/liquidity/prepare") {
+            val req = try {
+                json.decodeFromString<LiquidityPrepareRequest>(call.receiveText())
+            } catch (e: Exception) {
+                return@post call.respondError("INVALID_BODY", "Invalid JSON body")
+            }
+
+            val session = sessionManager.getSession(req.cookie)
+            if (session == null) {
+                return@post call.respondText(
+                    json.encodeToString(ApiResponse.error<Unit>("SESSION_NOT_FOUND", "Session expired or invalid")),
+                    ContentType.Application.Json,
+                    HttpStatusCode.Unauthorized,
+                )
+            }
+
+            if (!session.walletConnected) {
+                return@post call.respondText(
+                    json.encodeToString(ApiResponse.error<Unit>("WALLET_NOT_CONNECTED", "Wally wallet not connected")),
+                    ContentType.Application.Json,
+                    HttpStatusCode.BadRequest,
+                )
+            }
+
+            if (session.pendingTdpp != null) {
+                return@post call.respondText(
+                    json.encodeToString(ApiResponse.error<Unit>("TDPP_PENDING", "A transaction is already pending confirmation")),
+                    ContentType.Application.Json,
+                    HttpStatusCode.Conflict,
+                )
+            }
+
+            val action = when (req.action.uppercase()) {
+                "ADD" -> "add_liquidity"
+                "REMOVE" -> "remove_liquidity"
+                else -> return@post call.respondError("INVALID_PARAM", "action must be ADD or REMOVE")
+            }
+
+            if (action == "add_liquidity" && (req.nexSats <= 0 || req.tokenAmount <= 0)) {
+                return@post call.respondError("INVALID_PARAM", "nexSats and tokenAmount must be positive for ADD")
+            }
+            if (action == "remove_liquidity" && req.lpTokenAmount <= 0) {
+                return@post call.respondError("INVALID_PARAM", "lpTokenAmount must be positive for REMOVE")
+            }
+
+            val walletUtxos = session.walletAssets.toList()
+            logger.info("liquidity/prepare: action={}, walletAssets={}, assetsLoaded={}",
+                action, walletUtxos.size, session.assetsLoaded)
+
+            val tdppResult = swapServiceV2.prepareLiquidityTdpp(
+                poolId = req.poolId,
+                action = action,
+                nexSats = req.nexSats,
+                tokenAmount = req.tokenAmount,
+                lpTokenAmount = req.lpTokenAmount,
+                walletAssets = walletUtxos,
+            ).getOrElse { error ->
+                return@post call.respondError(error.type, error.message)
+            }
+
+            // Store pending TDPP
+            session.pendingTdpp = PendingTdpp(
+                poolId = tdppResult.poolId,
+                action = action,
+                direction = null,
+                amountIn = if (action == "add_liquidity") req.nexSats else req.lpTokenAmount,
+                expectedAmountOut = tdppResult.lpTokenAmount,
+                newNexReserve = tdppResult.newPoolNex,
+                newTokenReserve = tdppResult.newPoolTokens,
+                partialTxHex = tdppResult.partialTxHex,
+                nexAmount = tdppResult.nexAmount,
+                tokenAmount = tdppResult.tokenAmount,
+                lpTokenAmount = tdppResult.lpTokenAmount,
+            )
+
+            // Build TDPP URI and push to Wally
+            // flags=14: NOPOST(2) | NOSHUFFLE(4) | PARTIAL(8)
+            // Token/LP inputs pre-included from /assets data (no FUND_GROUPS needed).
+            // NOPOST → server broadcasts.
+            val flags = 14
+            val inamt = tdppResult.totalInputSatoshis
+            val tdppUri = buildTdppUri(serverFqdn, req.cookie, tdppResult.partialTxHex, flags, inamt)
+            sessionManager.pushToWallet(session, tdppUri)
+
+            logger.info(
+                "Liquidity prepared: pool={}, action={}, nex={}, tokens={}, lp={}, txLen={}, session={}",
+                req.poolId, action, tdppResult.nexAmount, tdppResult.tokenAmount,
+                tdppResult.lpTokenAmount, tdppResult.partialTxHex.length, req.cookie.take(6) + "...",
+            )
+
+            call.respondText(
+                json.encodeToString(
+                    ApiResponse.success(
+                        LiquidityPrepareResponse(
+                            status = "PENDING_WALLET",
+                            poolId = tdppResult.poolId,
+                            action = action,
+                            nexAmount = tdppResult.nexAmount,
+                            tokenAmount = tdppResult.tokenAmount,
+                            lpTokenAmount = tdppResult.lpTokenAmount,
                         ),
                     ),
                 ),

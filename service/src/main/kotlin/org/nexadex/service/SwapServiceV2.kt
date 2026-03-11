@@ -563,6 +563,212 @@ class SwapServiceV2(
     }
 
     /**
+     * Build a partial liquidity transaction for TDPP (Wally wallet signing).
+     * Returns the partial tx hex and metadata for the pending TDPP.
+     */
+    suspend fun prepareLiquidityTdpp(
+        poolId: Int,
+        action: String, // "add_liquidity" or "remove_liquidity"
+        nexSats: Long = 0,
+        tokenAmount: Long = 0,
+        lpTokenAmount: Long = 0,
+        walletAssets: List<WalletAssetUtxo> = emptyList(),
+    ): DexResult<LiquidityTdppResult> {
+        val pool = poolRepo.findById(poolId)
+            ?: return DexResult.failure(DexError.PoolNotFound(poolId))
+
+        if (pool.status != PoolStatus.ACTIVE) {
+            return DexResult.failure(DexError.PoolNotActive(poolId, pool.status.name))
+        }
+
+        val instance = try {
+            poolService.getContractInstance(pool)
+        } catch (e: Exception) {
+            return DexResult.failure(DexError.InternalError("Failed to get contract instance: ${e.message}"))
+        }
+
+        // Query on-chain state — need BOTH pool and LP reserve outpoints
+        val lpState: AmmDexPoolState
+        val lastBroadcast = recentBroadcasts[poolId]
+        val skipChainRefresh = lastBroadcast != null &&
+            Duration.between(lastBroadcast, Instant.now()).seconds < 15
+
+        lpState = try {
+            when (val r = NexaSDK.contract.getAmmDexPoolState(
+                instance = instance,
+                tradeGroupId = pool.tokenGroupIdHex,
+                lpGroupId = pool.lpGroupIdHex,
+                initialLpSupply = pool.initialLpSupply,
+            )) {
+                is SdkResult.Success -> {
+                    val state = r.value
+                    // Update DB if outpoint changed and not in recent-broadcast window
+                    if (!skipChainRefresh && state.poolOutpointHash != null) {
+                        val dbOutpoint = pool.poolUtxoTxId
+                        if (state.poolOutpointHash != dbOutpoint) {
+                            logger.info("prepareLiquidityTdpp: refreshed pool state: outpoint {} -> {}",
+                                dbOutpoint?.take(12), state.poolOutpointHash!!.take(12))
+                            poolRepo.updatePoolUtxoAndReserves(
+                                poolId, state.poolOutpointHash!!, 0,
+                                state.nexReserve.satoshis, state.tokenReserve,
+                            )
+                        }
+                    }
+                    state
+                }
+                is SdkResult.Failure -> {
+                    return DexResult.failure(DexError.InternalError("Failed to query pool LP state: ${r.error}"))
+                }
+            }
+        } catch (e: Exception) {
+            return DexResult.failure(DexError.InternalError("Pool state query failed: ${e.message}"))
+        }
+
+        val poolOutpoint = lpState.poolOutpointHash
+            ?: return DexResult.failure(DexError.InternalError("Pool outpoint not available from chain"))
+        val lpReserveOutpoint = lpState.lpReserveOutpointHash
+            ?: return DexResult.failure(DexError.InternalError("LP reserve outpoint not available from chain"))
+
+        logger.info("prepareLiquidityTdpp: action={}, pool={}, poolOutpoint={}, lpOutpoint={}, nex={}, tokens={}, lpReserve={}, lpCirc={}",
+            action, poolId, poolOutpoint.take(12), lpReserveOutpoint.take(12),
+            lpState.nexReserve.satoshis, lpState.tokenReserve,
+            lpState.lpReserveBalance, lpState.lpInCirculation)
+
+        val partialResult = when (action) {
+            "add_liquidity" -> {
+                // Filter wallet UTXOs for trade tokens
+                val matchingUtxos = walletAssets
+                    .filter { it.groupIdHex?.equals(pool.tokenGroupIdHex, ignoreCase = true) == true }
+                    .filter { it.tokenAmount > 0 }
+
+                logger.info("prepareLiquidityTdpp ADD: {} wallet UTXOs match trade group", matchingUtxos.size)
+
+                if (matchingUtxos.isEmpty()) {
+                    return DexResult.failure(DexError.InvalidOperation(
+                        "No matching trade token UTXOs in wallet. Reconnect wallet or wait for /assets to load.",
+                    ))
+                }
+
+                val sdkUtxos = matchingUtxos.map { Triple(it.outpointHash, it.amount, it.tokenAmount) }
+                NexaSDK.contract.buildAmmDexAddLiquidityPartial(
+                    instance = instance,
+                    nexAmount = nexSats,
+                    tokenAmount = tokenAmount,
+                    tradeGroupId = pool.tokenGroupIdHex,
+                    lpGroupId = pool.lpGroupIdHex,
+                    initialLpSupply = pool.initialLpSupply,
+                    knownPoolOutpointHash = poolOutpoint,
+                    knownLpReserveOutpointHash = lpReserveOutpoint,
+                    knownNexReserve = lpState.nexReserve.satoshis,
+                    knownTokenReserve = lpState.tokenReserve,
+                    knownLpReserveBalance = lpState.lpReserveBalance,
+                    knownLpInCirculation = lpState.lpInCirculation,
+                    walletTokenUtxos = sdkUtxos,
+                )
+            }
+            "remove_liquidity" -> {
+                // Filter wallet UTXOs for LP tokens
+                val matchingUtxos = walletAssets
+                    .filter { it.groupIdHex?.equals(pool.lpGroupIdHex, ignoreCase = true) == true }
+                    .filter { it.tokenAmount > 0 }
+
+                logger.info("prepareLiquidityTdpp REMOVE: {} wallet UTXOs match LP group", matchingUtxos.size)
+
+                if (matchingUtxos.isEmpty()) {
+                    return DexResult.failure(DexError.InvalidOperation(
+                        "No matching LP token UTXOs in wallet. Reconnect wallet or wait for /assets to load.",
+                    ))
+                }
+
+                val sdkUtxos = matchingUtxos.map { Triple(it.outpointHash, it.amount, it.tokenAmount) }
+                NexaSDK.contract.buildAmmDexRemoveLiquidityPartial(
+                    instance = instance,
+                    lpTokenAmount = lpTokenAmount,
+                    tradeGroupId = pool.tokenGroupIdHex,
+                    lpGroupId = pool.lpGroupIdHex,
+                    initialLpSupply = pool.initialLpSupply,
+                    knownPoolOutpointHash = poolOutpoint,
+                    knownLpReserveOutpointHash = lpReserveOutpoint,
+                    knownNexReserve = lpState.nexReserve.satoshis,
+                    knownTokenReserve = lpState.tokenReserve,
+                    knownLpReserveBalance = lpState.lpReserveBalance,
+                    knownLpInCirculation = lpState.lpInCirculation,
+                    walletLpUtxos = sdkUtxos,
+                )
+            }
+            else -> return DexResult.failure(DexError.InvalidOperation("Unknown liquidity action: $action"))
+        }
+
+        return when (partialResult) {
+            is SdkResult.Success -> {
+                val r = partialResult.value
+                logger.info("Liquidity TDPP partial tx built: pool={}, action={}, nex={}, tokens={}, lp={}, txLen={}",
+                    poolId, action, r.nexAmount, r.tokenAmount, r.lpTokenAmount, r.partialTxHex.length)
+
+                DexResult.success(
+                    LiquidityTdppResult(
+                        partialTxHex = r.partialTxHex,
+                        poolId = poolId,
+                        action = action,
+                        nexAmount = r.nexAmount,
+                        tokenAmount = r.tokenAmount,
+                        lpTokenAmount = r.lpTokenAmount,
+                        newPoolNex = r.newPoolNex,
+                        newPoolTokens = r.newPoolTokens,
+                        newLpReserve = r.newLpReserve,
+                        totalInputSatoshis = r.totalInputSatoshis,
+                    ),
+                )
+            }
+            is SdkResult.Failure -> {
+                logger.error("Liquidity TDPP partial tx build failed: pool={}, error={}", poolId, partialResult.error)
+                DexResult.failure(DexError.InternalError("Failed to build liquidity partial tx: ${partialResult.error}"))
+            }
+        }
+    }
+
+    /**
+     * Broadcast a Wally-signed liquidity transaction and update pool reserves.
+     */
+    suspend fun broadcastAndRecordLiquidity(
+        signedTxHex: String,
+        poolId: Int,
+        action: String,
+        nexAmount: Long,
+        tokenAmount: Long,
+        lpTokenAmount: Long,
+        newNexReserve: Long,
+        newTokenReserve: Long,
+    ): DexResult<LiquidityResult> {
+        val broadcastResult = broadcastTransaction(signedTxHex, poolId)
+        if (broadcastResult.isFailure) {
+            return DexResult.failure(broadcastResult.errorOrNull()!!)
+        }
+
+        val txIdem = broadcastResult.getOrNull()!!
+
+        // Compute outpoint hash for pool UTXO tracking (output[0] is always the new pool UTXO)
+        val outpointHash = computeOutpointHash(txIdem, 0)
+        logger.info("Liquidity broadcast success: txIdem={}, outpointHash={}", txIdem, outpointHash.take(12))
+
+        poolRepo.updatePoolUtxoAndReserves(poolId, outpointHash, 0, newNexReserve, newTokenReserve)
+        recentBroadcasts[poolId] = Instant.now()
+
+        val resultAction = if (action == "add_liquidity") "ADD" else "REMOVE"
+
+        return DexResult.success(
+            LiquidityResult(
+                txId = txIdem,
+                poolId = poolId,
+                action = resultAction,
+                nexAmount = nexAmount,
+                tokenAmount = tokenAmount,
+                lpTokenAmount = lpTokenAmount,
+            ),
+        )
+    }
+
+    /**
      * Execute a swap using the user's mnemonic.
      * SDK handles all UTXO selection, tx building, signing, and broadcasting.
      */

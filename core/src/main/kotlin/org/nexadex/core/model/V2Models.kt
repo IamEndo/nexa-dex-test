@@ -64,6 +64,20 @@ data class SwapTdppResult(
 )
 
 @Serializable
+data class LiquidityTdppResult(
+    val partialTxHex: String,
+    val poolId: Int,
+    val action: String,
+    val nexAmount: Long,
+    val tokenAmount: Long,
+    val lpTokenAmount: Long,
+    val newPoolNex: Long,
+    val newPoolTokens: Long,
+    val newLpReserve: Long,
+    val totalInputSatoshis: Long = 0L,
+)
+
+@Serializable
 data class LiquidityResult(
     val txId: String,
     val poolId: Int,

@@ -118,7 +118,14 @@ fun main() {
     logger.info("  GET  /tx                                 - Wally tx return + broadcast")
     logger.info("  WS   /ws/session                         - Browser session WS")
 
-    val server = embeddedServer(Netty, port = config.server.port, host = config.server.host) {
+    val server = embeddedServer(Netty, port = config.server.port, host = config.server.host, configure = {
+        // Wally returns signed tx hex in GET /tx?tx=HEX query param.
+        // Liquidity txs can exceed 4500 hex chars → URL > 4096 bytes (Netty default).
+        // Without this, Netty silently rejects the callback at the HTTP codec level.
+        httpServerCodec = {
+            io.netty.handler.codec.http.HttpServerCodec(16384, 8192, 8192)
+        }
+    }) {
         dexModule(config, poolService, swapServiceV2, liquidityService, analyticsService, eventBus, poolRepo, tokenRepo, tradeRepo, sessionManager, authService, startTime)
     }
 

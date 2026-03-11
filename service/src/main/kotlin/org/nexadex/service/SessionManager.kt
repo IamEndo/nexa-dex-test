@@ -254,6 +254,10 @@ data class PendingTdpp(
     val newNexReserve: Long,
     val newTokenReserve: Long,
     val partialTxHex: String,
+    // Liquidity-specific fields
+    val nexAmount: Long = 0,
+    val tokenAmount: Long = 0,
+    val lpTokenAmount: Long = 0,
     val createdAt: Instant = Instant.now(),
 )
 
