@@ -59,6 +59,7 @@ data class SwapTdppResult(
     val minimumReceived: Long,
     val newPoolNex: Long,
     val newPoolTokens: Long,
+    val totalInputSatoshis: Long = 0L,
 )
 
 @Serializable

@@ -107,11 +107,21 @@ fun Application.tdppRoutes(
                 return@post call.respondError(error.type, error.message)
             }
 
+            // For SELL swaps, require NexID auth (need user address for token UTXOs)
+            val userAddress = if (dir == TradeDirection.SELL) {
+                session.nexAddress
+                    ?: return@post call.respondError(
+                        "AUTH_REQUIRED",
+                        "NexID authentication required for SELL swaps (need address for token lookup)",
+                    )
+            } else null
+
             // Build partial transaction via SDK
-            val tdppResult = swapServiceV2.prepareSwapTdpp(req.poolId, dir, req.amountIn, req.maxSlippageBps)
-                .getOrElse { error ->
-                    return@post call.respondError(error.type, error.message)
-                }
+            val tdppResult = swapServiceV2.prepareSwapTdpp(
+                req.poolId, dir, req.amountIn, req.maxSlippageBps, userAddress,
+            ).getOrElse { error ->
+                return@post call.respondError(error.type, error.message)
+            }
 
             // Store pending TDPP
             session.pendingTdpp = PendingTdpp(
@@ -126,17 +136,20 @@ fun Application.tdppRoutes(
             )
 
             // Build TDPP URI and push to Wally
-            // Flags: NOPOST(2) | NOSHUFFLE(4) | PARTIAL(8) | FUND_GROUPS(16) = 30 for SELL
-            // Flags: NOPOST(2) | NOSHUFFLE(4) | PARTIAL(8) = 14 for BUY
-            val flags = if (dir == TradeDirection.SELL) 30 else 14
-            // inamt = total satoshis of inputs already in partial tx (pool UTXO's old NEX reserve)
-            // Wally requires this when NOFUND flag is not set (tricklePaySession.kt:928)
-            // Reverse-compute old pool NEX from new reserves and swap amounts:
-            //   BUY:  oldNex = newPoolNex - amountIn  (pool gained NEX from user)
-            //   SELL: oldNex = newPoolNex + amountOut  (pool sent NEX to user)
-            val inamt = when (dir) {
-                TradeDirection.BUY -> tdppResult.newPoolNex - tdppResult.amountIn
-                TradeDirection.SELL -> tdppResult.newPoolNex + tdppResult.amountOut
+            // Flags: NOPOST(2) | NOSHUFFLE(4) | PARTIAL(8) = 14 for both BUY and SELL
+            // SELL no longer uses FUND_GROUPS(16) because user token inputs are pre-included
+            val flags = 14
+            // inamt = total satoshis of inputs already in partial tx
+            // For BUY: just the pool UTXO's NEX reserve
+            // For SELL: pool UTXO's NEX + user token input dust amounts (from SDK)
+            val inamt = if (tdppResult.totalInputSatoshis > 0) {
+                tdppResult.totalInputSatoshis
+            } else {
+                // Fallback for backward compat: reverse-compute from reserves
+                when (dir) {
+                    TradeDirection.BUY -> tdppResult.newPoolNex - tdppResult.amountIn
+                    TradeDirection.SELL -> tdppResult.newPoolNex + tdppResult.amountOut
+                }
             }
             val tdppUri = buildTdppUri(serverFqdn, req.cookie, tdppResult.partialTxHex, flags, inamt)
             sessionManager.pushToWallet(session, tdppUri)

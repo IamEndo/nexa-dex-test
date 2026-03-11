@@ -245,6 +245,7 @@ class SwapServiceV2(
         direction: TradeDirection,
         amountIn: Long,
         maxSlippageBps: Int = tradingConfig.maxSlippageBps,
+        userAddress: String? = null,
     ): DexResult<SwapTdppResult> {
         val pool = poolRepo.findById(poolId)
             ?: return DexResult.failure(DexError.PoolNotFound(poolId))
@@ -275,15 +276,31 @@ class SwapServiceV2(
         logger.info("prepareSwapTdpp: pool={}, dir={}, poolUtxoTxId={}, vout={}, nexReserve={}, tokenReserve={}",
             poolId, direction, pool.poolUtxoTxId, pool.poolUtxoVout, pool.nexReserve, pool.tokenReserve)
 
-        val partialResult = NexaSDK.contract.buildAmmDexSwapPartial(
-            instance = instance,
-            direction = sdkDirection,
-            amountIn = amountIn,
-            tradeGroupId = pool.tokenGroupIdHex,
-            knownPoolOutpointHash = pool.poolUtxoTxId!!,
-            knownNexReserve = pool.nexReserve,
-            knownTokenReserve = pool.tokenReserve,
-        )
+        // For SELL swaps with a known user address, use the overload that includes
+        // user token inputs in the partial tx (avoids Wally FUND_GROUPS issue).
+        val partialResult = if (direction == TradeDirection.SELL && userAddress != null) {
+            logger.info("prepareSwapTdpp: SELL with user token inputs, userAddr={}", userAddress.take(20) + "...")
+            NexaSDK.contract.buildAmmDexSwapPartial(
+                instance = instance,
+                direction = sdkDirection,
+                amountIn = amountIn,
+                tradeGroupId = pool.tokenGroupIdHex,
+                knownPoolOutpointHash = pool.poolUtxoTxId!!,
+                knownNexReserve = pool.nexReserve,
+                knownTokenReserve = pool.tokenReserve,
+                userAddress = userAddress,
+            )
+        } else {
+            NexaSDK.contract.buildAmmDexSwapPartial(
+                instance = instance,
+                direction = sdkDirection,
+                amountIn = amountIn,
+                tradeGroupId = pool.tokenGroupIdHex,
+                knownPoolOutpointHash = pool.poolUtxoTxId!!,
+                knownNexReserve = pool.nexReserve,
+                knownTokenReserve = pool.tokenReserve,
+            )
+        }
 
         return when (partialResult) {
             is SdkResult.Success -> {
@@ -312,6 +329,7 @@ class SwapServiceV2(
                         minimumReceived = minimumReceived,
                         newPoolNex = r.newPoolNex,
                         newPoolTokens = r.newPoolTokens,
+                        totalInputSatoshis = r.totalInputSatoshis,
                     ),
                 )
             }
