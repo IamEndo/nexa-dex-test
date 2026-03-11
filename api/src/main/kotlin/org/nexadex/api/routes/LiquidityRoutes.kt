@@ -111,6 +111,10 @@ fun Application.liquidityRoutes(
                 return@post call.respondError("INVALID_BODY", "Invalid JSON body")
             }
 
+            if (req.cookie.isNotBlank()) {
+                // TDPP/Wally-based liquidity — not yet implemented
+                return@post call.respondError("NOT_IMPLEMENTED", "Wallet-based liquidity is not yet supported. Use mnemonic flow.")
+            }
             if (req.mnemonic.isBlank()) {
                 return@post call.respondError("INVALID_PARAM", "Mnemonic is required")
             }
@@ -162,6 +166,10 @@ fun Application.liquidityRoutes(
                 return@post call.respondError("INVALID_BODY", "Invalid JSON body")
             }
 
+            if (req.cookie.isNotBlank()) {
+                // TDPP/Wally-based liquidity — not yet implemented
+                return@post call.respondError("NOT_IMPLEMENTED", "Wallet-based liquidity is not yet supported. Use mnemonic flow.")
+            }
             if (req.mnemonic.isBlank()) {
                 return@post call.respondError("INVALID_PARAM", "Mnemonic is required")
             }

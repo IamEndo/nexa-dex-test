@@ -228,6 +228,16 @@ data class DexSession(
     // TDPP transaction state — volatile for cross-thread visibility
     @Volatile var pendingTdpp: PendingTdpp? = null,
 
+    // Known addresses where user's tokens may reside (from BUY delivery, /_share, etc.)
+    // Used for SELL swaps to find token UTXOs across multiple HD wallet addresses.
+    val knownTokenAddresses: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet(),
+
+    // Wallet asset UTXOs from TDPP /assets query (NiftyArt pattern).
+    // Wally scans ALL HD addresses and returns every grouped UTXO it owns.
+    // Key = outpointHash, Value = WalletAssetUtxo with prevout script, amount, etc.
+    val walletAssets: MutableList<WalletAssetUtxo> = java.util.Collections.synchronizedList(mutableListOf()),
+    @Volatile var assetsLoaded: Boolean = false,
+
     val createdAt: Instant = Instant.now(),
     var expiresAt: Instant = Instant.now().plusSeconds(7200),
 )
@@ -245,6 +255,34 @@ data class PendingTdpp(
     val newTokenReserve: Long,
     val partialTxHex: String,
     val createdAt: Instant = Instant.now(),
+)
+
+/**
+ * A grouped UTXO reported by Wally wallet via the /assets TDPP endpoint.
+ * Matches Wally's TricklePayAssetInfo format.
+ */
+data class WalletAssetUtxo(
+    val outpointHash: String,
+    val amount: Long,
+    val prevoutHex: String,
+    val groupIdHex: String? = null,
+    val tokenAmount: Long = 0,
+)
+
+/**
+ * Wally's asset list response (matches TricklePayAssetList in Wally/NiftyArt).
+ */
+@Serializable
+data class TricklePayAssetInfo(
+    val outpointHash: String,
+    val amt: Long,
+    val prevout: String,
+    val proof: String? = null,
+)
+
+@Serializable
+data class TricklePayAssetList(
+    val assets: List<TricklePayAssetInfo>,
 )
 
 @Serializable

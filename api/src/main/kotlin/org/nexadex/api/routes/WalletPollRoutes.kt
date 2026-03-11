@@ -13,9 +13,113 @@ import org.nexadex.api.dto.ApiResponse
 import org.nexadex.core.model.TradeDirection
 import org.nexadex.service.SessionManager
 import org.nexadex.service.SwapServiceV2
+import org.nexadex.service.TricklePayAssetList
+import org.nexadex.service.WalletAssetUtxo
 import org.nexadex.service.WsBrowserMessage
 import org.slf4j.LoggerFactory
 import java.time.Instant
+
+/**
+ * Parse a grouped output prevout hex to extract group ID and token amount.
+ *
+ * The prevout may be:
+ * a) Just the script: starts with 0x20 (push 32 bytes of groupId)
+ * b) Full serialized output: [type:1][amount:8LE][scriptLen:varint][script]
+ *
+ * The script itself starts with: [0x20][groupId:32bytes][amtLen:1byte][amtLE:amtLen bytes]...
+ *
+ * Fallback: search for the 0x20 push marker followed by 32 bytes + valid amount length.
+ *
+ * Returns Pair(groupIdHex, tokenAmount) or null if not a grouped output.
+ */
+private fun parseGroupedPrevout(prevoutHex: String): Pair<String, Long>? {
+    try {
+        if (prevoutHex.length < 72) return null
+
+        // Try multiple offsets: the script might start at different positions
+        // depending on whether prevout is full output or just script
+        val offsets = mutableListOf<Int>()
+
+        // Offset 0: prevout IS the script
+        offsets.add(0)
+
+        // Search for 0x20 (push 32 bytes) anywhere in the hex — that's our group ID push
+        var searchFrom = 0
+        while (searchFrom < prevoutHex.length - 68) {
+            val idx = prevoutHex.indexOf("20", searchFrom)
+            if (idx < 0 || idx >= prevoutHex.length - 68) break
+            if (idx % 2 == 0) offsets.add(idx) // only even positions (byte boundaries)
+            searchFrom = idx + 2
+        }
+
+        for (hexOffset in offsets) {
+            val result = tryParseGroupAtOffset(prevoutHex, hexOffset)
+            if (result != null) return result
+        }
+
+        return null
+    } catch (e: Exception) {
+        return null
+    }
+}
+
+private fun tryParseGroupAtOffset(hex: String, hexOffset: Int): Pair<String, Long>? {
+    try {
+        if (hexOffset + 68 > hex.length) return null
+        val pushByte = hex.substring(hexOffset, hexOffset + 2).toInt(16)
+        if (pushByte != 0x20) return null // must be push-32-bytes
+
+        // Group ID: 32 bytes
+        val groupIdHex = hex.substring(hexOffset + 2, hexOffset + 66)
+
+        // Validate: group ID should end with "0000" (Nexa group IDs end with 00 subgroup)
+        if (!groupIdHex.endsWith("0000")) return null
+
+        // Group amount: next byte is push length
+        if (hexOffset + 68 > hex.length) return null
+        val amtLen = hex.substring(hexOffset + 66, hexOffset + 68).toInt(16)
+        if (amtLen != 2 && amtLen != 4 && amtLen != 8) return null
+        if (hexOffset + 68 + amtLen * 2 > hex.length) return null
+
+        // Read amount (little-endian)
+        val amtHex = hex.substring(hexOffset + 68, hexOffset + 68 + amtLen * 2)
+        var amount = 0L
+        for (i in 0 until amtLen) {
+            val byteVal = amtHex.substring(i * 2, i * 2 + 2).toLong(16)
+            amount = amount or (byteVal shl (i * 8))
+        }
+        if (amount <= 0) return null
+
+        return Pair(groupIdHex, amount)
+    } catch (e: Exception) {
+        return null
+    }
+}
+
+/**
+ * Extract P2ST address from raw hex bytes. Looks for the pattern:
+ * 00 51 14 <20-byte-hash> (OP_0 OP_1 PUSH20 constraintArgsHash)
+ */
+private fun extractAddressFromHex(hex: String): String? {
+    // Find "005114" in the hex string
+    val marker = "005114"
+    val idx = hex.indexOf(marker)
+    if (idx < 0 || idx + marker.length + 40 > hex.length) return null
+    val hashHex = hex.substring(idx + marker.length, idx + marker.length + 40)
+    val hashBytes = ByteArray(20) { i ->
+        ((Character.digit(hashHex[i * 2], 16) shl 4) + Character.digit(hashHex[i * 2 + 1], 16)).toByte()
+    }
+    return try {
+        when (val addr = org.nexa.sdk.types.primitives.Address.fromComponents(
+            org.nexa.sdk.types.wallet.Network.MAINNET,
+            org.nexa.sdk.types.wallet.AddressType.PAY_TO_SCRIPT_TEMPLATE,
+            hashBytes,
+        )) {
+            is org.nexa.sdk.types.common.SdkResult.Success -> addr.value.toString()
+            is org.nexa.sdk.types.common.SdkResult.Failure -> null
+        }
+    } catch (e: Exception) { null }
+}
 
 private val logger = LoggerFactory.getLogger("org.nexadex.api.WalletPollRoutes")
 private val json = Json { encodeDefaults = true; ignoreUnknownKeys = true }
@@ -83,6 +187,15 @@ fun Application.walletPollRoutes(sessionManager: SessionManager, swapServiceV2: 
                     logger.info("/_lp: requesting address via share: {}", shareUri.take(60))
                     sessionManager.pushToWallet(session, shareUri)
                 }
+
+                // Request asset list (NiftyArt pattern): Wally scans ALL HD addresses
+                // for grouped UTXOs and POSTs results to /assets?cookie=SESSION.
+                // af=f1f1 is SatoshiScript(TEMPLATE, TMPL_DATA, TMPL_DATA) — matches any grouped output.
+                if (!session.assetsLoaded) {
+                    val assetUri = "tdpp://$serverFqdn/assets?chain=nexa&af=f1f1&rproto=https&cookie=$cookie"
+                    logger.info("/_lp: requesting wallet assets: {}", assetUri.take(70))
+                    sessionManager.pushToWallet(session, assetUri)
+                }
             }
 
             // First poll (i=0): respond immediately like NiftyArt
@@ -128,6 +241,7 @@ fun Application.walletPollRoutes(sessionManager: SessionManager, swapServiceV2: 
 
             if (body.startsWith("nexa:")) {
                 session.nexAddress = body
+                session.knownTokenAddresses.add(body)
                 logger.info("/_share: got wallet address for session={}: {}", cookie.take(6), body.take(20) + "...")
 
                 // Notify browsers that we now have the address
@@ -139,6 +253,80 @@ fun Application.walletPollRoutes(sessionManager: SessionManager, swapServiceV2: 
                 }
             } else {
                 logger.info("/_share: received non-address data for session={}: {}", cookie.take(6), body.take(30))
+            }
+
+            call.respondText("ok")
+        }
+
+        /**
+         * POST /assets?cookie={sessionId}
+         *
+         * Wally posts its grouped UTXOs here after processing a TDPP asset query.
+         * Body is JSON matching TricklePayAssetList: {"assets": [{"outpointHash":"...", "amt":123, "prevout":"..."}]}
+         * This is the NiftyArt-proven pattern for discovering token UTXOs across
+         * all HD wallet addresses. Used for SELL swaps.
+         */
+        post("/assets") {
+            val cookie = call.request.queryParameters["cookie"]
+            val body = call.receiveText().trim()
+
+            if (cookie.isNullOrBlank()) {
+                call.respondText("error: no cookie", status = HttpStatusCode.BadRequest)
+                return@post
+            }
+
+            val session = sessionManager.getSession(cookie)
+            if (session == null) {
+                call.respondText("error: session not found", status = HttpStatusCode.Unauthorized)
+                return@post
+            }
+
+            try {
+                val assetList = json.decodeFromString<TricklePayAssetList>(body)
+                logger.info("/assets: received {} assets for session={}", assetList.assets.size, cookie.take(6))
+
+                // Clear old assets and store new ones
+                session.walletAssets.clear()
+                for (asset in assetList.assets) {
+                    // Parse prevout hex to extract group ID and token amount.
+                    // Grouped script format: pushData(groupId:32bytes) pushData(groupAmountLE) [locking_script]
+                    // pushData for 32 bytes: 0x20 [32 bytes]
+                    // pushData for 2-8 bytes: [length_byte] [amount_bytes]
+                    val parsed = parseGroupedPrevout(asset.prevout)
+
+                    session.walletAssets.add(
+                        WalletAssetUtxo(
+                            outpointHash = asset.outpointHash,
+                            amount = asset.amt,
+                            prevoutHex = asset.prevout,
+                            groupIdHex = parsed?.first,
+                            tokenAmount = parsed?.second ?: 0,
+                        )
+                    )
+                    // Extract P2ST address from the prevout script
+                    val addr = extractAddressFromHex(asset.prevout)
+                    if (addr != null) {
+                        session.knownTokenAddresses.add(addr)
+                    }
+                    logger.info("/assets: UTXO outpoint={}, nexAmt={}, groupId={}, tokenAmt={}, addr={}, prevout[0..40]={}",
+                        asset.outpointHash.take(16), asset.amt,
+                        parsed?.first?.take(16) ?: "PARSE_FAIL", parsed?.second ?: 0,
+                        addr?.take(20) ?: "N/A",
+                        asset.prevout.take(80))
+                }
+                session.assetsLoaded = true
+
+                // Notify browsers that assets have been loaded
+                launch {
+                    sessionManager.pushToBrowsers(session, WsBrowserMessage(
+                        type = "assets_loaded",
+                        data = """{"count":${assetList.assets.size}}""",
+                    ))
+                }
+            } catch (e: Exception) {
+                logger.warn("/assets: failed to parse asset list for session={}: {}", cookie.take(6), e.message)
+                // Even on error, mark as loaded so we don't retry endlessly
+                session.assetsLoaded = true
             }
 
             call.respondText("ok")
@@ -210,6 +398,14 @@ fun Application.walletPollRoutes(sessionManager: SessionManager, swapServiceV2: 
 
                     result
                         .onSuccess { swapResult ->
+                            // Capture token delivery address from BUY swaps for future SELL use.
+                            // HD wallets use many addresses; this tells us where tokens actually went.
+                            if (swapResult.tokenDeliveryAddress != null) {
+                                session.knownTokenAddresses.add(swapResult.tokenDeliveryAddress!!)
+                                logger.info("Stored token delivery address for session={}: {}",
+                                    cookie?.take(6), swapResult.tokenDeliveryAddress!!.take(20) + "...")
+                            }
+
                             // Notify browsers with the real result
                             launch {
                                 sessionManager.pushToBrowsers(session, WsBrowserMessage(

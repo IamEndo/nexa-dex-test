@@ -29,6 +29,7 @@ data class SwapResult(
     val amountIn: Long,
     val amountOut: Long,
     val price: Double,
+    val tokenDeliveryAddress: String? = null,
 )
 
 @Serializable

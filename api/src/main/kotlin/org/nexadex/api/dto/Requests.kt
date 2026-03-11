@@ -37,12 +37,14 @@ data class AddLiquidityRequest(
     val poolId: Int,
     val nexSats: Long,
     val tokenAmount: Long,
-    val mnemonic: String,
+    val mnemonic: String = "",
+    val cookie: String = "",
 )
 
 @Serializable
 data class RemoveLiquidityRequest(
     val poolId: Int,
     val lpTokenAmount: Long,
-    val mnemonic: String,
+    val mnemonic: String = "",
+    val cookie: String = "",
 )

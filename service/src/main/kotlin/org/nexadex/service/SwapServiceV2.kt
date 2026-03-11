@@ -10,10 +10,15 @@ import org.nexadex.data.repository.TradeRepository
 import org.nexa.sdk.NexaSDK
 import org.nexa.sdk.types.common.SdkResult
 import org.nexa.sdk.types.contract.AmmDexPoolState
+import org.nexa.sdk.types.primitives.Address
+import org.nexa.sdk.types.wallet.AddressType
 import org.nexa.sdk.types.wallet.Mnemonic
 import org.nexa.sdk.types.wallet.Network
 import org.slf4j.LoggerFactory
 import java.security.MessageDigest
+import java.time.Duration
+import java.time.Instant
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * V2 swap service for permissionless DEX.
@@ -29,6 +34,12 @@ class SwapServiceV2(
     private val poolService: PoolService,
 ) {
     private val logger = LoggerFactory.getLogger(SwapServiceV2::class.java)
+
+    // Track recent broadcast timestamps per pool to avoid stale chain refresh.
+    // After broadcast, Rostrum may take several seconds to index the new tx.
+    // During that window, getAmmDexPoolState returns the OLD outpoint, which
+    // would overwrite our correct post-broadcast outpoint in DB.
+    private val recentBroadcasts = ConcurrentHashMap<Int, Instant>()
 
     /**
      * Returns current pool state including UTXO outpoint, contract info, and LP state.
@@ -161,8 +172,23 @@ class SwapServiceV2(
                     DexResult.success(txIdem)
                 }
                 is SdkResult.Failure -> {
+                    val errMsg = result.error.toString()
+                    // If tx is already in mempool (Wally broadcast with no NOPOST flag),
+                    // that's fine — decode to get txIdem and treat as success.
+                    // NOTE: txn-txpool-conflict is the Nexa node error (error 258) when
+                    // re-broadcasting a tx that's already in the mempool. Different from
+                    // txn-mempool-conflict (Bitcoin-style). Both must be handled.
+                    if (errMsg.contains("txn-mempool-conflict") || errMsg.contains("already in") ||
+                        errMsg.contains("txn-already-in-mempool") || errMsg.contains("Already in") ||
+                        errMsg.contains("txn-txpool-conflict")
+                    ) {
+                        logger.info("Tx already in mempool for pool $poolId (Wally broadcast), extracting txIdem")
+                        val txIdem = extractTxIdemFromSignedTx(signedTxHex)
+                        if (txIdem != null) {
+                            return DexResult.success(txIdem)
+                        }
+                    }
                     logger.warn("Relay failed for pool $poolId: {}", result.error)
-                    // Decode tx to diagnose which input is conflicting
                     logTxInputDiagnostics(signedTxHex, poolId)
                     DexResult.failure(DexError.BroadcastFailed("Relay rejected: ${result.error}"))
                 }
@@ -170,6 +196,25 @@ class SwapServiceV2(
         } catch (e: Exception) {
             logger.error("Relay exception for pool $poolId", e)
             DexResult.failure(DexError.BroadcastFailed("Relay error: ${e.message}"))
+        }
+    }
+
+    /**
+     * Extract txIdem from a signed transaction hex by decoding it.
+     * Used when the tx is already in mempool (Wally broadcast it) and we just need the ID.
+     */
+    private fun extractTxIdemFromSignedTx(signedTxHex: String): String? {
+        return try {
+            when (val decoded = NexaSDK.transaction.decode(signedTxHex)) {
+                is SdkResult.Success -> decoded.value.txIdem.hex
+                is SdkResult.Failure -> {
+                    logger.warn("Could not decode tx for txIdem extraction: {}", decoded.error)
+                    null
+                }
+            }
+        } catch (e: Exception) {
+            logger.warn("txIdem extraction failed: {}", e.message)
+            null
         }
     }
 
@@ -186,17 +231,29 @@ class SwapServiceV2(
                     logger.warn("=== TX DIAGNOSTIC for pool {} ===", poolId)
                     logger.warn("  txIdem={}, inputs={}, outputs={}, size={}",
                         tx.txIdem.hex, tx.inputCount, tx.outputCount, tx.size)
+                    logger.warn("  rawTxHex[0..200]={}", signedTxHex.take(200))
                     tx.inputs.forEachIndexed { idx, input ->
-                        logger.warn("  Input[{}]: outpointHash={}, amount={} sat, type={}",
+                        val sigBytes = try { input.scriptSig.bytes } catch (_: Exception) { ByteArray(0) }
+                        val sigHex = sigBytes.joinToString("") { "%02x".format(it) }
+                        logger.warn("  Input[{}]: outpointHash={}, amount={} sat, type={}, scriptSigLen={}, scriptSig[0..40]={}",
                             idx,
                             input.outpointHash ?: "N/A",
                             input.amount.satoshis,
                             input.inputType,
+                            sigBytes.size,
+                            sigHex.take(40),
                         )
                     }
                     tx.outputs.forEachIndexed { idx, output ->
-                        logger.warn("  Output[{}]: amount={} sat, type={}",
-                            idx, output.amount.satoshis, output.outputType)
+                        val scriptBytes = try { output.script.bytes } catch (_: Exception) { ByteArray(0) }
+                        val scriptHex = scriptBytes.joinToString("") { "%02x".format(it) }
+                        logger.warn("  Output[{}]: amount={} sat, type={}, groupId={}, groupAmt={}, scriptLen={}, script[0..60]={}",
+                            idx, output.amount.satoshis, output.outputType,
+                            output.groupId?.hashHex?.take(16) ?: "none",
+                            output.groupAmount ?: 0,
+                            scriptBytes.size,
+                            scriptHex.take(60),
+                        )
                     }
                 }
                 is SdkResult.Failure -> {
@@ -245,7 +302,7 @@ class SwapServiceV2(
         direction: TradeDirection,
         amountIn: Long,
         maxSlippageBps: Int = tradingConfig.maxSlippageBps,
-        userAddress: String? = null,
+        walletTokenUtxos: List<WalletAssetUtxo> = emptyList(),
     ): DexResult<SwapTdppResult> {
         val pool = poolRepo.findById(poolId)
             ?: return DexResult.failure(DexError.PoolNotFound(poolId))
@@ -269,37 +326,48 @@ class SwapServiceV2(
 
         // Refresh pool state from chain to avoid stale outpoints (txn-txpool-conflict).
         // The indexer polls every 15s, but swaps can happen faster.
+        // IMPORTANT: Skip chain refresh if we recently broadcast for this pool,
+        // because Rostrum may not have indexed the new tx yet and would return
+        // the OLD outpoint, overwriting our correct post-broadcast outpoint in DB.
         var poolOutpoint = pool.poolUtxoTxId!!
         var nexReserve = pool.nexReserve
         var tokenReserve = pool.tokenReserve
-        try {
-            when (val r = NexaSDK.contract.getAmmDexPoolState(
-                instance = instance,
-                tradeGroupId = pool.tokenGroupIdHex,
-                lpGroupId = pool.lpGroupIdHex ?: "",
-                initialLpSupply = pool.initialLpSupply,
-            )) {
-                is SdkResult.Success -> {
-                    val state = r.value
-                    if (state.poolOutpointHash != null) {
-                        if (state.poolOutpointHash != poolOutpoint) {
-                            logger.info("prepareSwapTdpp: refreshed pool state from chain: outpoint {} -> {}, nex {} -> {}, tokens {} -> {}",
-                                poolOutpoint.take(12), state.poolOutpointHash!!.take(12),
-                                nexReserve, state.nexReserve.satoshis, tokenReserve, state.tokenReserve)
-                            poolOutpoint = state.poolOutpointHash!!
-                            nexReserve = state.nexReserve.satoshis
-                            tokenReserve = state.tokenReserve
-                            // Update DB for future requests
-                            poolRepo.updatePoolUtxoAndReserves(poolId, poolOutpoint, 0, nexReserve, tokenReserve)
+        val lastBroadcast = recentBroadcasts[poolId]
+        val skipChainRefresh = lastBroadcast != null &&
+            Duration.between(lastBroadcast, Instant.now()).seconds < 15
+        if (skipChainRefresh) {
+            logger.info("prepareSwapTdpp: skipping chain refresh (broadcast {}s ago), trusting DB outpoint={}",
+                Duration.between(lastBroadcast, Instant.now()).seconds, poolOutpoint.take(12))
+        } else {
+            try {
+                when (val r = NexaSDK.contract.getAmmDexPoolState(
+                    instance = instance,
+                    tradeGroupId = pool.tokenGroupIdHex,
+                    lpGroupId = pool.lpGroupIdHex ?: "",
+                    initialLpSupply = pool.initialLpSupply,
+                )) {
+                    is SdkResult.Success -> {
+                        val state = r.value
+                        if (state.poolOutpointHash != null) {
+                            if (state.poolOutpointHash != poolOutpoint) {
+                                logger.info("prepareSwapTdpp: refreshed pool state from chain: outpoint {} -> {}, nex {} -> {}, tokens {} -> {}",
+                                    poolOutpoint.take(12), state.poolOutpointHash!!.take(12),
+                                    nexReserve, state.nexReserve.satoshis, tokenReserve, state.tokenReserve)
+                                poolOutpoint = state.poolOutpointHash!!
+                                nexReserve = state.nexReserve.satoshis
+                                tokenReserve = state.tokenReserve
+                                // Update DB for future requests
+                                poolRepo.updatePoolUtxoAndReserves(poolId, poolOutpoint, 0, nexReserve, tokenReserve)
+                            }
                         }
                     }
+                    is SdkResult.Failure -> {
+                        logger.warn("prepareSwapTdpp: could not refresh pool state, using DB values: {}", r.error)
+                    }
                 }
-                is SdkResult.Failure -> {
-                    logger.warn("prepareSwapTdpp: could not refresh pool state, using DB values: {}", r.error)
-                }
+            } catch (e: Exception) {
+                logger.warn("prepareSwapTdpp: pool state refresh failed, using DB values: {}", e.message)
             }
-        } catch (e: Exception) {
-            logger.warn("prepareSwapTdpp: pool state refresh failed, using DB values: {}", e.message)
         }
 
         val sdkDirection = org.nexa.sdk.types.contract.TradeDirection.valueOf(direction.name)
@@ -307,10 +375,30 @@ class SwapServiceV2(
         logger.info("prepareSwapTdpp: pool={}, dir={}, outpoint={}, nexReserve={}, tokenReserve={}",
             poolId, direction, poolOutpoint.take(12), nexReserve, tokenReserve)
 
-        // For SELL swaps with a known user address, use the overload that includes
-        // user token inputs in the partial tx (avoids Wally FUND_GROUPS issue).
-        val partialResult = if (direction == TradeDirection.SELL && userAddress != null) {
-            logger.info("prepareSwapTdpp: SELL with user token inputs, userAddr={}", userAddress.take(20) + "...")
+        // BUY: first SDK overload (pool-side only). Wally adds NEX funding + signs.
+        // SELL: new overload with pre-resolved wallet token UTXOs (from /assets TDPP).
+        //   Uses Wally's own outpoint hashes so getTxo() can find and enrich them.
+        //   No FUND_GROUPS needed — token inputs are pre-included.
+        val partialResult = if (direction == TradeDirection.SELL) {
+            // Filter wallet UTXOs by trade group and build SDK input list
+            val matchingUtxos = walletTokenUtxos
+                .filter { it.groupIdHex?.equals(pool.tokenGroupIdHex, ignoreCase = true) == true }
+                .filter { it.tokenAmount > 0 }
+
+            logger.info("prepareSwapTdpp SELL: {} wallet UTXOs total, {} match trade group {}",
+                walletTokenUtxos.size, matchingUtxos.size, pool.tokenGroupIdHex.take(16))
+            matchingUtxos.forEachIndexed { idx, u ->
+                logger.info("  UTXO[{}]: outpoint={}, tokens={}, nex={}",
+                    idx, u.outpointHash.take(16), u.tokenAmount, u.amount)
+            }
+
+            if (matchingUtxos.isEmpty()) {
+                return DexResult.failure(DexError.InvalidOperation(
+                    "SELL: no matching token UTXOs in wallet. Reconnect wallet or wait for /assets to load.",
+                ))
+            }
+
+            val sdkUtxos = matchingUtxos.map { Triple(it.outpointHash, it.amount, it.tokenAmount) }
             NexaSDK.contract.buildAmmDexSwapPartial(
                 instance = instance,
                 direction = sdkDirection,
@@ -319,9 +407,10 @@ class SwapServiceV2(
                 knownPoolOutpointHash = poolOutpoint,
                 knownNexReserve = nexReserve,
                 knownTokenReserve = tokenReserve,
-                userAddress = userAddress,
+                walletTokenUtxos = sdkUtxos,
             )
         } else {
+            // BUY: pool-side only
             NexaSDK.contract.buildAmmDexSwapPartial(
                 instance = instance,
                 direction = sdkDirection,
@@ -402,6 +491,43 @@ class SwapServiceV2(
         // how the indexer stores Rostrum's outpoint_hash for pool UTXO tracking.
         poolRepo.updatePoolUtxoAndReserves(poolId, outpointHash, 0, newNexReserve, newTokenReserve)
 
+        // Track broadcast time so prepareSwapTdpp skips chain refresh during
+        // the window where Rostrum hasn't indexed our new tx yet.
+        recentBroadcasts[poolId] = Instant.now()
+
+        // For BUY swaps, extract the token delivery address from the signed tx.
+        // Output[1] is the token delivery — Wally replaced OP_TMPL with the user's
+        // actual address script. We capture this address so subsequent SELL swaps
+        // can find the user's tokens (HD wallets use many addresses).
+        var tokenDeliveryAddress: String? = null
+        if (direction == TradeDirection.BUY) {
+            try {
+                when (val decoded = NexaSDK.transaction.decode(signedTxHex)) {
+                    is SdkResult.Success -> {
+                        val tx = decoded.value
+                        if (tx.outputs.size > 1) {
+                            // Extract user address from output[1] script.
+                            // After Wally replaces OP_TMPL, script contains:
+                            //   [group_data...] 00 51 14 <20-byte-constraintArgsHash>
+                            // The 00 51 14 pattern is P2ST: OP_0 OP_1 PUSH20
+                            val scriptBytes = tx.outputs[1].script.bytes
+                            tokenDeliveryAddress = extractP2STAddress(scriptBytes)
+                            if (tokenDeliveryAddress != null) {
+                                logger.info("BUY token delivery address captured: {}", tokenDeliveryAddress!!.take(20) + "...")
+                            } else {
+                                logger.warn("BUY output[1]: could not extract address from script (len={})", scriptBytes.size)
+                            }
+                        }
+                    }
+                    is SdkResult.Failure -> {
+                        logger.warn("Could not decode signed tx for address capture: {}", decoded.error)
+                    }
+                }
+            } catch (e: Exception) {
+                logger.warn("Token delivery address capture failed: {}", e.message)
+            }
+        }
+
         // Record trade (use txIdem for display/tracking)
         try {
             val trade = Trade(
@@ -431,6 +557,7 @@ class SwapServiceV2(
                 amountIn = amountIn,
                 amountOut = expectedAmountOut,
                 price = price,
+                tokenDeliveryAddress = tokenDeliveryAddress,
             ),
         )
     }
@@ -570,6 +697,30 @@ class SwapServiceV2(
     }
 
     /**
+     * Extract a P2ST address from a raw output script.
+     * Looks for the pattern: 00 51 14 <20-byte-hash> (OP_0 OP_1 PUSH20 hash).
+     * Returns the CashAddr string or null if not found.
+     */
+    private fun extractP2STAddress(scriptBytes: ByteArray): String? {
+        // Find P2ST marker: 00 51 14 (OP_0 OP_1 PUSH20)
+        for (i in 0 until scriptBytes.size - 22) {
+            if (scriptBytes[i] == 0x00.toByte() &&
+                scriptBytes[i + 1] == 0x51.toByte() &&
+                scriptBytes[i + 2] == 0x14.toByte()
+            ) {
+                val hash = scriptBytes.sliceArray(i + 3 until i + 23)
+                return when (val addr = Address.fromComponents(
+                    Network.MAINNET, AddressType.PAY_TO_SCRIPT_TEMPLATE, hash,
+                )) {
+                    is SdkResult.Success -> addr.value.toString()
+                    is SdkResult.Failure -> null
+                }
+            }
+        }
+        return null
+    }
+
+    /**
      * Compute Nexa outpoint hash: SHA256(txIdem_LE_bytes || vout_uint32_LE).
      * Returns hex string (big-endian, matching Rostrum's outpoint_hash format).
      */
@@ -595,5 +746,114 @@ class SwapServiceV2(
             data[i / 2] = ((Character.digit(hex[i], 16) shl 4) + Character.digit(hex[i + 1], 16)).toByte()
         }
         return data
+    }
+
+    private fun bytesToHex(bytes: ByteArray): String =
+        bytes.joinToString("") { "%02x".format(it) }
+
+    /**
+     * Strip OP_TMPL_SKIP (0xF0) outputs from a signed transaction.
+     * NiftyArt-proven pattern: the OP_TMPL_SKIP output is a FUND_GROUPS hint
+     * that tells Wally what tokens to add. After Wally signs, server removes it
+     * before broadcasting. Safe because PARTIAL sighash doesn't cover it.
+     *
+     * Nexa tx wire format:
+     *   [version:4][inputCount:varint][inputs...][outputCount:varint][outputs...][locktime:4]
+     * Each output: [type:1][amount:8][scriptLen:varint][script:scriptLen]
+     */
+    fun stripTmplSkipOutputs(txHex: String): String {
+        val bytes = hexToBytes(txHex)
+        var pos = 4 // skip version (4 bytes)
+
+        // Skip inputs
+        val (inputCount, icBytes) = readVarInt(bytes, pos)
+        pos += icBytes
+        for (i in 0 until inputCount.toInt()) {
+            pos += 1  // input type
+            pos += 32 // outpoint hash
+            pos += 8  // amount
+            val (scriptLen, slBytes) = readVarInt(bytes, pos)
+            pos += slBytes
+            pos += scriptLen.toInt() // scriptSig
+            pos += 4 // sequence
+        }
+
+        // Parse outputs
+        val outputCountPos = pos
+        val (outputCount, ocBytes) = readVarInt(bytes, pos)
+        pos += ocBytes
+
+        data class OutputRange(val start: Int, val end: Int, val isTmplSkip: Boolean)
+        val outputs = mutableListOf<OutputRange>()
+        for (i in 0 until outputCount.toInt()) {
+            val start = pos
+            pos += 1  // output type
+            pos += 8  // amount
+            val (scriptLen, slBytes) = readVarInt(bytes, pos)
+            pos += slBytes
+            val scriptEnd = pos + scriptLen.toInt()
+            // OP_TMPL_SKIP = 0xF0 as last byte of script
+            val isTmplSkip = scriptLen > 0 && bytes[scriptEnd - 1] == 0xF0.toByte()
+            pos = scriptEnd
+            outputs.add(OutputRange(start, pos, isTmplSkip))
+        }
+
+        val locktimePos = pos
+        val keepOutputs = outputs.filter { !it.isTmplSkip }
+        if (keepOutputs.size == outputs.size) return txHex // nothing to strip
+
+        val stripped = outputs.count { it.isTmplSkip }
+        logger.info("stripTmplSkipOutputs: removing {} OP_TMPL_SKIP output(s), {} -> {} outputs",
+            stripped, outputs.size, keepOutputs.size)
+
+        // Rebuild tx: version + inputs + new output count + kept outputs + locktime
+        val result = java.io.ByteArrayOutputStream(bytes.size)
+        result.write(bytes, 0, outputCountPos) // version + inputs
+        result.write(writeVarInt(keepOutputs.size.toLong())) // new output count
+        for (o in keepOutputs) {
+            result.write(bytes, o.start, o.end - o.start)
+        }
+        result.write(bytes, locktimePos, bytes.size - locktimePos) // locktime
+
+        return bytesToHex(result.toByteArray())
+    }
+
+    /** Read a Bitcoin-style variable-length integer. Returns (value, bytesConsumed). */
+    private fun readVarInt(bytes: ByteArray, offset: Int): Pair<Long, Int> {
+        val first = bytes[offset].toInt() and 0xFF
+        return when {
+            first < 0xFD -> Pair(first.toLong(), 1)
+            first == 0xFD -> {
+                val v = ((bytes[offset + 1].toInt() and 0xFF)) or
+                    ((bytes[offset + 2].toInt() and 0xFF) shl 8)
+                Pair(v.toLong(), 3)
+            }
+            first == 0xFE -> {
+                val v = ((bytes[offset + 1].toInt() and 0xFF)) or
+                    ((bytes[offset + 2].toInt() and 0xFF) shl 8) or
+                    ((bytes[offset + 3].toInt() and 0xFF) shl 16) or
+                    ((bytes[offset + 4].toInt() and 0xFF) shl 24)
+                Pair(v.toLong() and 0xFFFFFFFFL, 5)
+            }
+            else -> {
+                var v = 0L
+                for (i in 0 until 8) {
+                    v = v or ((bytes[offset + 1 + i].toLong() and 0xFF) shl (i * 8))
+                }
+                Pair(v, 9)
+            }
+        }
+    }
+
+    /** Write a Bitcoin-style variable-length integer. */
+    private fun writeVarInt(value: Long): ByteArray = when {
+        value < 0xFD -> byteArrayOf(value.toByte())
+        value <= 0xFFFF -> byteArrayOf(0xFD.toByte(), (value and 0xFF).toByte(), ((value ushr 8) and 0xFF).toByte())
+        value <= 0xFFFFFFFFL -> byteArrayOf(
+            0xFE.toByte(),
+            (value and 0xFF).toByte(), ((value ushr 8) and 0xFF).toByte(),
+            ((value ushr 16) and 0xFF).toByte(), ((value ushr 24) and 0xFF).toByte(),
+        )
+        else -> byteArrayOf(0xFF.toByte()) + ByteArray(8) { i -> ((value ushr (i * 8)) and 0xFF).toByte() }
     }
 }
