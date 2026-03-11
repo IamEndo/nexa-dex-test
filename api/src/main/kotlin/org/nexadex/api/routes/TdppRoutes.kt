@@ -157,12 +157,11 @@ fun Application.tdppRoutes(
             )
 
             // Build TDPP URI and push to Wally
-            // BUY flags:  NOSHUFFLE(4) | PARTIAL(8) = 12
-            //   No NOPOST → Wally broadcasts. Server also broadcasts (txn-txpool-conflict handled).
-            // SELL flags: NOPOST(2) | NOSHUFFLE(4) | PARTIAL(8) = 14
-            //   Token inputs pre-included from /assets data (no FUND_GROUPS needed).
-            //   NOPOST → server broadcasts.
-            val flags = if (dir == TradeDirection.BUY) 12 else 14
+            // flags=14: NOPOST(2) | NOSHUFFLE(4) | PARTIAL(8)
+            // NOPOST ensures server always broadcasts — Wally only signs and returns.
+            // Without NOPOST, Wally broadcasts itself but if the callback fails
+            // (mobile network, timeout), server never learns the tx succeeded.
+            val flags = 14
             // inamt = total satoshis of inputs already in partial tx (just the pool UTXO)
             val inamt = if (tdppResult.totalInputSatoshis > 0) {
                 tdppResult.totalInputSatoshis

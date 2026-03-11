@@ -80,7 +80,7 @@ fun main() {
     }
 
     // Start chain indexer
-    val chainIndexer = ChainIndexer(poolService, poolRepo, tradeRepo, eventBus, config.indexer)
+    val chainIndexer = ChainIndexer(poolService, poolRepo, tradeRepo, eventBus, config.indexer, sessionManager)
     chainIndexer.start(appScope)
 
     // Start session cleanup + wallet liveness monitor

@@ -13,6 +13,7 @@ import org.nexadex.service.BlockNotification
 import org.nexadex.service.EventBus
 import org.nexadex.service.PoolService
 import org.nexadex.service.PriceUpdate
+import org.nexadex.service.SessionManager
 import org.nexa.sdk.NexaSDK
 import org.nexa.sdk.types.common.SdkResult
 import org.nexa.sdk.types.primitives.Address
@@ -32,6 +33,7 @@ class ChainIndexer(
     private val tradeRepo: TradeRepository,
     private val eventBus: EventBus,
     private val config: IndexerConfig,
+    private val sessionManager: SessionManager? = null,
 ) {
     private val logger = LoggerFactory.getLogger(ChainIndexer::class.java)
     private val sdk get() = NexaSDK
@@ -213,11 +215,22 @@ class ChainIndexer(
                     }
 
                     // Update pool UTXO and reserves in DB.
-                    // Store the outpoint hash as poolUtxoTxId — the SDK's new overload
-                    // computes SHA256(txIdem||vout) which matches Rostrum's outpoint_hash.
-                    // However, Rostrum provides the outpoint_hash directly here, so we
-                    // need to track it properly. Use outpoint as the reference.
                     poolRepo.updatePoolUtxoAndReserves(pool.poolId, onChainOutpoint, 0, onChainNex, onChainTokens)
+
+                    // Chain reconciliation: if any session has a pending TDPP that matches
+                    // the new on-chain reserves, auto-complete it. Handles the case where
+                    // Wally's callback failed (mobile network, timeout).
+                    sessionManager?.let { sm ->
+                        try {
+                            val serverFqdn = System.getenv("NEXADEX_SERVER_FQDN") ?: "localhost:9090"
+                            val reconciled = sm.reconcilePendingTdpp(pool.poolId, onChainNex, onChainTokens, serverFqdn)
+                            if (reconciled != null) {
+                                logger.info("Auto-reconciled pending TDPP for pool {} via chain indexer", pool.poolId)
+                            }
+                        } catch (e: Exception) {
+                            logger.warn("TDPP reconciliation failed for pool {}: {}", pool.poolId, e.message)
+                        }
+                    }
                 }
             } catch (e: CancellationException) {
                 throw e

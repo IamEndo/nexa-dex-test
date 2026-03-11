@@ -418,6 +418,13 @@ fun Application.walletPollRoutes(sessionManager: SessionManager, swapServiceV2: 
                                 ))
                             }
 
+                            // Refresh wallet assets — UTXOs changed after tx
+                            session.assetsLoaded = false
+                            session.walletAssets.clear()
+                            val assetUri = "tdpp://$serverFqdn/assets?chain=nexa&af=f1f1&rproto=https&cookie=$cookie"
+                            sessionManager.pushToWallet(session, assetUri)
+                            logger.info("Requested wallet asset refresh after swap for session={}", cookie?.take(6))
+
                             call.respondText(
                                 json.encodeToString(TxReturnResponse("ok", "Swap broadcast: ${swapResult.txId}")),
                                 ContentType.Application.Json,
@@ -462,6 +469,13 @@ fun Application.walletPollRoutes(sessionManager: SessionManager, swapServiceV2: 
                                     data = """{"action":"${pending.action}","txId":"${lpResult.txId}","poolId":${lpResult.poolId},"nexAmount":${lpResult.nexAmount},"tokenAmount":${lpResult.tokenAmount},"lpTokenAmount":${lpResult.lpTokenAmount}}""",
                                 ))
                             }
+
+                            // Refresh wallet assets — UTXOs changed after tx
+                            session.assetsLoaded = false
+                            session.walletAssets.clear()
+                            val assetUri = "tdpp://$serverFqdn/assets?chain=nexa&af=f1f1&rproto=https&cookie=$cookie"
+                            sessionManager.pushToWallet(session, assetUri)
+                            logger.info("Requested wallet asset refresh after {} for session={}", pending.action, cookie?.take(6))
 
                             call.respondText(
                                 json.encodeToString(TxReturnResponse("ok", "Liquidity broadcast: ${lpResult.txId}")),

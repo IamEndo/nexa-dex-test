@@ -32,7 +32,7 @@ class SessionManager {
         private const val CLEANUP_INTERVAL_MS = 60_000L
         private const val WALLET_MONITOR_INTERVAL_MS = 10_000L  // Check wallet liveness every 10s
         private const val WALLET_LIVENESS_TIMEOUT_MS = 15_000L  // Wallet dead if no poll for 15s
-        private const val PENDING_TDPP_TIMEOUT_MS = 60_000L    // Clear stale pendingTdpp after 60s
+        private const val PENDING_TDPP_TIMEOUT_MS = 30_000L    // Clear stale pendingTdpp after 30s
         private const val CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
     }
 
@@ -194,6 +194,53 @@ class SessionManager {
             return false
         }
         return true
+    }
+
+    /**
+     * Chain-based reconciliation: when ChainIndexer detects a pool state change,
+     * find any session with a matching pendingTdpp and auto-complete it.
+     * Handles the case where Wally's GET /tx callback fails (mobile network, timeout).
+     *
+     * Returns the reconciled session, or null if no match.
+     */
+    suspend fun reconcilePendingTdpp(
+        poolId: Int,
+        onChainNexReserve: Long,
+        onChainTokenReserve: Long,
+        serverFqdn: String,
+    ): DexSession? {
+        for ((_, session) in sessions) {
+            val pending = session.pendingTdpp ?: continue
+            if (pending.poolId != poolId) continue
+
+            // Match: on-chain reserves equal the expected post-tx reserves
+            if (pending.newNexReserve == onChainNexReserve &&
+                pending.newTokenReserve == onChainTokenReserve
+            ) {
+                session.pendingTdpp = null
+                logger.info(
+                    "Chain reconciled pendingTdpp: session={}, pool={}, action={}",
+                    session.sessionId.take(6), poolId, pending.action,
+                )
+
+                pushToBrowsers(session, WsBrowserMessage(
+                    type = "tx_signed",
+                    data = """{"action":"${pending.action}","poolId":$poolId,"reconciled":true,"direction":"${pending.direction ?: ""}"}""",
+                ))
+
+                // Invalidate stale wallet assets and request refresh
+                session.assetsLoaded = false
+                session.walletAssets.clear()
+                if (session.walletConnected) {
+                    val assetUri = "tdpp://$serverFqdn/assets?chain=nexa&af=f1f1&rproto=https&cookie=${session.sessionId}"
+                    pushToWallet(session, assetUri)
+                    logger.info("Requested wallet asset refresh after reconciliation for session={}", session.sessionId.take(6))
+                }
+
+                return session
+            }
+        }
+        return null
     }
 
     fun activeSessionCount(): Int = sessions.size
