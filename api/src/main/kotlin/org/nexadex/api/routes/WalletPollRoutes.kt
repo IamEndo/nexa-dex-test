@@ -30,7 +30,7 @@ data class TxReturnResponse(
 
 // --- Routes ---
 
-fun Application.walletPollRoutes(sessionManager: SessionManager, swapServiceV2: SwapServiceV2) {
+fun Application.walletPollRoutes(sessionManager: SessionManager, swapServiceV2: SwapServiceV2, serverFqdn: String) {
     routing {
 
         /**
@@ -76,6 +76,13 @@ fun Application.walletPollRoutes(sessionManager: SessionManager, swapServiceV2: 
                         data = """{"status":"connected"}""",
                     ))
                 }
+                // Request wallet address via TDPP share mechanism.
+                // Wally will POST its address to /_share?cookie=SESSION.
+                if (session.nexAddress == null) {
+                    val shareUri = "tdpp://$serverFqdn/share?info=address&rproto=https&cookie=$cookie"
+                    logger.info("/_lp: requesting address via share: {}", shareUri.take(60))
+                    sessionManager.pushToWallet(session, shareUri)
+                }
             }
 
             // First poll (i=0): respond immediately like NiftyArt
@@ -95,6 +102,46 @@ fun Application.walletPollRoutes(sessionManager: SessionManager, swapServiceV2: 
                 // Keep-alive: empty response, wallet will poll again
                 call.respondText("")
             }
+        }
+
+        /**
+         * POST /_share?cookie={sessionId}
+         *
+         * Wally posts shared information here after processing a TDPP share request.
+         * For info=address, body contains the wallet's Nexa address string.
+         * This is how we get the user's address without NexID auth.
+         */
+        post("/_share") {
+            val cookie = call.request.queryParameters["cookie"]
+            val body = call.receiveText().trim()
+
+            if (cookie.isNullOrBlank()) {
+                call.respondText("error: no cookie", status = HttpStatusCode.BadRequest)
+                return@post
+            }
+
+            val session = sessionManager.getSession(cookie)
+            if (session == null) {
+                call.respondText("error: session not found", status = HttpStatusCode.Unauthorized)
+                return@post
+            }
+
+            if (body.startsWith("nexa:")) {
+                session.nexAddress = body
+                logger.info("/_share: got wallet address for session={}: {}", cookie.take(6), body.take(20) + "...")
+
+                // Notify browsers that we now have the address
+                launch {
+                    sessionManager.pushToBrowsers(session, WsBrowserMessage(
+                        type = "wallet_connection",
+                        data = """{"status":"authenticated","address":"$body"}""",
+                    ))
+                }
+            } else {
+                logger.info("/_share: received non-address data for session={}: {}", cookie.take(6), body.take(30))
+            }
+
+            call.respondText("ok")
         }
 
         /**

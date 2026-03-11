@@ -267,14 +267,45 @@ class SwapServiceV2(
             return DexResult.failure(DexError.InternalError("Failed to get contract instance: ${e.message}"))
         }
 
-        // Build partial transaction via SDK using DB-tracked pool UTXO.
-        // This bypasses the SDK's Rostrum query which can return stale UTXOs
-        // when the previous swap tx is still unconfirmed in the mempool.
-        // The SDK computes outpointHash = SHA256(txIdem_LE || vout_uint32_LE) internally.
+        // Refresh pool state from chain to avoid stale outpoints (txn-txpool-conflict).
+        // The indexer polls every 15s, but swaps can happen faster.
+        var poolOutpoint = pool.poolUtxoTxId!!
+        var nexReserve = pool.nexReserve
+        var tokenReserve = pool.tokenReserve
+        try {
+            when (val r = NexaSDK.contract.getAmmDexPoolState(
+                instance = instance,
+                tradeGroupId = pool.tokenGroupIdHex,
+                lpGroupId = pool.lpGroupIdHex ?: "",
+                initialLpSupply = pool.initialLpSupply,
+            )) {
+                is SdkResult.Success -> {
+                    val state = r.value
+                    if (state.poolOutpointHash != null) {
+                        if (state.poolOutpointHash != poolOutpoint) {
+                            logger.info("prepareSwapTdpp: refreshed pool state from chain: outpoint {} -> {}, nex {} -> {}, tokens {} -> {}",
+                                poolOutpoint.take(12), state.poolOutpointHash!!.take(12),
+                                nexReserve, state.nexReserve.satoshis, tokenReserve, state.tokenReserve)
+                            poolOutpoint = state.poolOutpointHash!!
+                            nexReserve = state.nexReserve.satoshis
+                            tokenReserve = state.tokenReserve
+                            // Update DB for future requests
+                            poolRepo.updatePoolUtxoAndReserves(poolId, poolOutpoint, 0, nexReserve, tokenReserve)
+                        }
+                    }
+                }
+                is SdkResult.Failure -> {
+                    logger.warn("prepareSwapTdpp: could not refresh pool state, using DB values: {}", r.error)
+                }
+            }
+        } catch (e: Exception) {
+            logger.warn("prepareSwapTdpp: pool state refresh failed, using DB values: {}", e.message)
+        }
+
         val sdkDirection = org.nexa.sdk.types.contract.TradeDirection.valueOf(direction.name)
 
-        logger.info("prepareSwapTdpp: pool={}, dir={}, poolUtxoTxId={}, vout={}, nexReserve={}, tokenReserve={}",
-            poolId, direction, pool.poolUtxoTxId, pool.poolUtxoVout, pool.nexReserve, pool.tokenReserve)
+        logger.info("prepareSwapTdpp: pool={}, dir={}, outpoint={}, nexReserve={}, tokenReserve={}",
+            poolId, direction, poolOutpoint.take(12), nexReserve, tokenReserve)
 
         // For SELL swaps with a known user address, use the overload that includes
         // user token inputs in the partial tx (avoids Wally FUND_GROUPS issue).
@@ -285,9 +316,9 @@ class SwapServiceV2(
                 direction = sdkDirection,
                 amountIn = amountIn,
                 tradeGroupId = pool.tokenGroupIdHex,
-                knownPoolOutpointHash = pool.poolUtxoTxId!!,
-                knownNexReserve = pool.nexReserve,
-                knownTokenReserve = pool.tokenReserve,
+                knownPoolOutpointHash = poolOutpoint,
+                knownNexReserve = nexReserve,
+                knownTokenReserve = tokenReserve,
                 userAddress = userAddress,
             )
         } else {
@@ -296,9 +327,9 @@ class SwapServiceV2(
                 direction = sdkDirection,
                 amountIn = amountIn,
                 tradeGroupId = pool.tokenGroupIdHex,
-                knownPoolOutpointHash = pool.poolUtxoTxId!!,
-                knownNexReserve = pool.nexReserve,
-                knownTokenReserve = pool.tokenReserve,
+                knownPoolOutpointHash = poolOutpoint,
+                knownNexReserve = nexReserve,
+                knownTokenReserve = tokenReserve,
             )
         }
 
@@ -309,8 +340,8 @@ class SwapServiceV2(
 
                 // Compute price impact using our AMM math
                 val priceImpactBps = when (direction) {
-                    TradeDirection.SELL -> AmmMath.computePriceImpactBps(amountIn, r.expectedAmountOut, pool.tokenReserve, pool.nexReserve) ?: 0
-                    TradeDirection.BUY -> AmmMath.computePriceImpactBps(amountIn, r.expectedAmountOut, pool.nexReserve, pool.tokenReserve) ?: 0
+                    TradeDirection.SELL -> AmmMath.computePriceImpactBps(amountIn, r.expectedAmountOut, tokenReserve, nexReserve) ?: 0
+                    TradeDirection.BUY -> AmmMath.computePriceImpactBps(amountIn, r.expectedAmountOut, nexReserve, tokenReserve) ?: 0
                 }
                 val minimumReceived = AmmMath.computeMinimumReceived(r.expectedAmountOut, maxSlippageBps)
 

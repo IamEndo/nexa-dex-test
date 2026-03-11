@@ -111,11 +111,11 @@ fun Application.dexModule(
     webSocketRoutes(eventBus)
 
     // Wally wallet integration routes
+    val serverFqdn = System.getenv("NEXADEX_SERVER_FQDN") ?: "localhost:9090"
     authRoutes(sessionManager, authService)
-    walletPollRoutes(sessionManager, swapServiceV2)
+    walletPollRoutes(sessionManager, swapServiceV2, serverFqdn)
     sessionWebSocketRoutes(sessionManager)
 
     // TDPP routes (Wally-signed transactions)
-    val serverFqdn = System.getenv("NEXADEX_SERVER_FQDN") ?: "localhost:9090"
     tdppRoutes(swapServiceV2, sessionManager, serverFqdn)
 }
