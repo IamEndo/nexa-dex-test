@@ -1,6 +1,7 @@
 package org.nexadex.data.repository
 
 import org.jetbrains.exposed.sql.*
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.nexadex.core.model.CandleInterval
 import org.nexadex.core.model.OhlcvCandle
@@ -84,6 +85,10 @@ class OhlcvRepository {
             .limit(1)
             .firstOrNull()
             ?.toCandle()
+    }
+
+    fun deleteByPool(poolId: Int) = transaction {
+        OhlcvTable.deleteWhere { OhlcvTable.poolId eq poolId }
     }
 
     private fun ResultRow.toCandle() = OhlcvCandle(

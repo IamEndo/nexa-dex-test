@@ -61,8 +61,10 @@ class AnalyticsService(
     fun recordTradeInCandles(trade: Trade) {
         val spotPrice = if (trade.tokenReserveAfter > 0) {
             trade.nexReserveAfter.toDouble() / trade.tokenReserveAfter.toDouble()
+        } else if (trade.price > 0.0) {
+            trade.price
         } else {
-            0.0
+            return // skip trades with no valid price
         }
 
         val (volNex, volToken) = when (trade.direction) {
@@ -102,6 +104,51 @@ class AnalyticsService(
 
             ohlcvRepo.upsert(candle)
             eventBus.emitCandleUpdate(candle)
+        }
+    }
+
+    /**
+     * Backfill OHLCV candles from historical trades for all active pools.
+     * Only runs if no candles exist yet.
+     */
+    fun backfillCandles() {
+        try {
+            logger.info("Checking candle backfill...")
+            val pools = poolRepo.findAll()
+            logger.info("Found {} total pools", pools.size)
+            val active = pools.filter { it.status == PoolStatus.ACTIVE }
+            logger.info("Found {} active pools for candle backfill", active.size)
+
+            for (pool in active) {
+                val existing = ohlcvRepo.findLatestCandle(pool.poolId, CandleInterval.H1)
+                if (existing != null && existing.openTime > 0) {
+                    logger.info("Pool {} already has valid candles (latest openTime={}), skipping", pool.poolId, existing.openTime)
+                    continue
+                }
+                if (existing != null && existing.openTime == 0L) {
+                    logger.info("Pool {} has bad candles (openTime=0), clearing and re-backfilling", pool.poolId)
+                    ohlcvRepo.deleteByPool(pool.poolId)
+                }
+
+                val trades = tradeRepo.findAllByPoolAsc(pool.poolId)
+                if (trades.isEmpty()) {
+                    logger.info("Pool {} has no confirmed trades, skipping", pool.poolId)
+                    continue
+                }
+
+                logger.info("Backfilling {} trades into candles for pool {}", trades.size, pool.poolId)
+                if (trades.isNotEmpty()) {
+                    val first = trades.first()
+                    logger.info("First trade: id={}, createdAt={}, price={}, nexAfter={}, tokAfter={}",
+                        first.tradeId, first.createdAt, first.price, first.nexReserveAfter, first.tokenReserveAfter)
+                }
+                for (trade in trades) {
+                    recordTradeInCandles(trade)
+                }
+                logger.info("Backfill complete for pool {}", pool.poolId)
+            }
+        } catch (e: Exception) {
+            logger.error("Candle backfill failed: {}", e.message, e)
         }
     }
 

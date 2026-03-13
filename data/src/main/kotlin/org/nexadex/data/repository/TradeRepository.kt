@@ -34,6 +34,13 @@ class TradeRepository {
         }
     }
 
+    fun findAllByPoolAsc(poolId: Int): List<Trade> = transaction {
+        TradesTable.selectAll()
+            .where { (TradesTable.poolId eq poolId) and (TradesTable.status eq TradeStatus.CONFIRMED.name) }
+            .orderBy(TradesTable.createdAt, SortOrder.ASC)
+            .map { it.toTrade() }
+    }
+
     fun findByPool(
         poolId: Int,
         limit: Int = 50,

@@ -59,6 +59,9 @@ fun main() {
     val liquidityService = LiquidityService(poolRepo, poolService)
     val analyticsService = AnalyticsService(poolRepo, tradeRepo, ohlcvRepo, eventBus)
 
+    // Backfill candles from historical trades (if needed)
+    analyticsService.backfillCandles()
+
     // Wire analytics to trade events
     val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     appScope.launch {
